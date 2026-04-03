@@ -340,7 +340,17 @@ textarea.form-input { min-height: 80px; }
 }
 @media (max-width: 480px) {
   .cards-grid { grid-template-columns: 1fr; }
-  .main { padding: 1.25rem 1rem 3rem; }
+  .main { padding: 1rem 0.75rem 3rem; }
+  .header { padding: 0 0.5rem; }
+  .logo-text { font-size: 1rem; }
+  .btn-primary .btn-text { display: none; }
+  .btn-primary { padding: 10px; }
+  .dashboard-row { gap: 1rem; }
+  .glass-panel { padding: 1.25rem; }
+  .modal-card { padding: 1.5rem 1rem; margin: 0 0.5rem; max-width: 100%; border-radius: 16px; }
+  .toast { right: 1rem; left: 1rem; text-align: center; }
+  .form-actions { justify-content: space-between; }
+  .form-actions button { flex: 1; justify-content: center; }
 }
 
 /* ── Animations ───────────────────────────────────────────────── */
