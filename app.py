@@ -1,42 +1,78 @@
 import os
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
-from db import get_connection, init_db
+from datetime import datetime
+from sqlalchemy import func, extract
+from decimal import Decimal
 
+# Load env variables (useful for local development)
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 app.secret_key = os.getenv("SECRET_KEY", "dev-secret")
 
+# ── Smart Database Switching ──────────────────────────────────────────
+database_url = os.environ.get('DATABASE_URL')
 
-# ── Serve Frontend ──────────────────────────────────────────────────────────
+if database_url:
+    # Fix for Railway's postgres:// URL (SQLAlchemy needs postgresql://)
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+else:
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///expenses.db'
 
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# ── Database Model ───────────────────────────────────────────────────
+class Expense(db.Model):
+    __tablename__ = 'expenses'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    amount = db.Column(db.Numeric(10, 2), nullable=False)
+    category = db.Column(db.String(100), nullable=False, default='Other')
+    date = db.Column(db.Date, nullable=False)
+    notes = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "amount": float(self.amount),
+            "category": self.category,
+            "date": self.date.strftime('%Y-%m-%d'),
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+# ── Initialize DB ───────────────────────────────────────────────────
+with app.app_context():
+    db.create_all()
+
+
+# ── Serve Frontend ───────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-# ── Expenses CRUD ────────────────────────────────────────────────────────────
-
+# ── Expenses CRUD ────────────────────────────────────────────────────
 @app.route("/api/expenses", methods=["GET"])
 def list_expenses():
     category = request.args.get("category")
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        if category and category != "All":
-            cur.execute(
-                "SELECT * FROM expenses WHERE category = ? ORDER BY date DESC, id DESC",
-                (category,)
-            )
-        else:
-            cur.execute("SELECT * FROM expenses ORDER BY date DESC, id DESC")
-        rows = cur.fetchall()
-        return jsonify([dict(r) for r in rows])
-    finally:
-        conn.close()
+    
+    query = Expense.query
+    if category and category != "All":
+        query = query.filter_by(category=category)
+        
+    # Order by date DESC, id DESC
+    expenses = query.order_by(Expense.date.desc(), Expense.id.desc()).all()
+    return jsonify([exp.to_dict() for exp in expenses])
 
 
 @app.route("/api/expenses", methods=["POST"])
@@ -47,125 +83,97 @@ def create_expense():
         if not data.get(field):
             return jsonify({"error": f"'{field}' is required"}), 400
 
-    conn = get_connection()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO expenses (title, amount, category, date, notes)
-            VALUES (?, ?, ?, ?, ?)
-            RETURNING *
-            """,
-            (data["title"], float(data["amount"]), data["category"],
-             data["date"], data.get("notes", ""))
+        new_exp = Expense(
+            title=data["title"],
+            amount=Decimal(str(data["amount"])),
+            category=data["category"],
+            date=datetime.strptime(data["date"], "%Y-%m-%d").date(),
+            notes=data.get("notes", "")
         )
-        row = cur.fetchone()
-        conn.commit()
-        return jsonify(dict(row)), 201
+        db.session.add(new_exp)
+        db.session.commit()
+        return jsonify(new_exp.to_dict()), 201
     except Exception as e:
-        conn.rollback()
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
 
 
 @app.route("/api/expenses/<int:expense_id>", methods=["PUT"])
 def update_expense(expense_id):
     data = request.get_json()
-    conn = get_connection()
+    exp = Expense.query.get(expense_id)
+    if not exp:
+        return jsonify({"error": "Expense not found"}), 404
+
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE expenses
-            SET title = ?, amount = ?, category = ?, date = ?, notes = ?
-            WHERE id = ?
-            RETURNING *
-            """,
-            (data["title"], float(data["amount"]), data["category"],
-             data["date"], data.get("notes", ""), expense_id)
-        )
-        row = cur.fetchone()
-        conn.commit()
-        if not row:
-            return jsonify({"error": "Expense not found"}), 404
-        return jsonify(dict(row))
+        exp.title = data["title"]
+        exp.amount = Decimal(str(data["amount"]))
+        exp.category = data["category"]
+        exp.date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+        exp.notes = data.get("notes", "")
+        
+        db.session.commit()
+        return jsonify(exp.to_dict())
     except Exception as e:
-        conn.rollback()
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
 
 
 @app.route("/api/expenses/<int:expense_id>", methods=["DELETE"])
 def delete_expense(expense_id):
-    conn = get_connection()
+    exp = Expense.query.get(expense_id)
+    if not exp:
+        return jsonify({"error": "Expense not found"}), 404
+
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM expenses WHERE id = ? RETURNING id", (expense_id,)
-        )
-        row = cur.fetchone()
-        conn.commit()
-        if not row:
-            return jsonify({"error": "Expense not found"}), 404
+        db.session.delete(exp)
+        db.session.commit()
         return jsonify({"message": "Deleted successfully", "id": expense_id})
     except Exception as e:
-        conn.rollback()
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
 
 
-# ── Summary ──────────────────────────────────────────────────────────────────
-
+# ── Summary ──────────────────────────────────────────────────────────
 @app.route("/api/expenses/summary", methods=["GET"])
 def summary():
-    conn = get_connection()
     try:
-        cur = conn.cursor()
         # Total overall
-        cur.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses")
-        total = float(cur.fetchone()["total"])
+        total = db.session.query(func.coalesce(func.sum(Expense.amount), 0)).scalar()
 
-        # This month
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(amount), 0) AS monthly
-            FROM expenses
-            WHERE strftime('%Y-%m', date) = strftime('%Y-%m', 'now')
-            """
-        )
-        monthly = float(cur.fetchone()["monthly"])
+        # This month 
+        current_year = datetime.utcnow().year
+        current_month = datetime.utcnow().month
+        monthly = db.session.query(func.coalesce(func.sum(Expense.amount), 0))\
+                    .filter(extract('year', Expense.date) == current_year)\
+                    .filter(extract('month', Expense.date) == current_month)\
+                    .scalar()
 
         # By category
-        cur.execute(
-            """
-            SELECT category, SUM(amount) AS total
-            FROM expenses
-            GROUP BY category
-            ORDER BY total DESC
-            """
-        )
+        by_category_raw = db.session.query(
+            Expense.category,
+            func.sum(Expense.amount).label('total')
+        ).group_by(Expense.category).order_by(func.sum(Expense.amount).desc()).all()
+        
         by_category = [
-            {"category": r["category"], "total": float(r["total"])}
-            for r in cur.fetchall()
+            {"category": row[0], "total": float(row[1])}
+            for row in by_category_raw
         ]
 
         top_category = by_category[0]["category"] if by_category else "N/A"
+        
         return jsonify({
-            "total": total,
-            "monthly": monthly,
+            "total": float(total),
+            "monthly": float(monthly),
             "top_category": top_category,
             "by_category": by_category
         })
-    finally:
-        conn.close()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
-
+# ── Entry Point ───────────────────────────────────────────────────────
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
